@@ -13,6 +13,10 @@ class Program
     private static string OllamaModel = "aisingapore/Gemma-SEA-LION-v4-27B-IT:latest";
     private const string OllamaUrl = "http://127.0.0.1:11434/api/generate";
     private const string Excluded = "";
+//>
+    //private const string ResxFolder = @"C:\Users\xxx\source\repos\ResxForge\Resources";
+    //private const string ConfigFolder = @"C:\Users\xxx\source\repos\ResxForge\config";
+    //private const string CacheFolder = @"C:\Users\xxx\source\repos\ResxForge\cache";
 
     private static readonly string ProjectRoot = GetProjectRoot();
 
@@ -40,7 +44,7 @@ class Program
 
     private static readonly string ResxFolder =
         Path.Combine(ProjectRoot, "Resources");
-
+//>
     private static readonly HashSet<string> ReviewLogExcludedPages =
         new(StringComparer.OrdinalIgnoreCase)
         {
