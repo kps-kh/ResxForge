@@ -693,7 +693,8 @@ RULES:
 - The output must be fully written in {langName}.
 
 
-{text}
+SOURCE TEXT: "{text}"
+{langName} TRANSLATION:
 """;
 }
 
