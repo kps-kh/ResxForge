@@ -13,11 +13,10 @@ class Program
     private static string OllamaModel = "aisingapore/Gemma-SEA-LION-v4-27B-IT:latest";
     private const string OllamaUrl = "http://127.0.0.1:11434/api/generate";
     private const string Excluded = "";
-//>
     //private const string ResxFolder = @"C:\Users\xxx\source\repos\ResxForge\Resources";
     //private const string ConfigFolder = @"C:\Users\xxx\source\repos\ResxForge\config";
     //private const string CacheFolder = @"C:\Users\xxx\source\repos\ResxForge\cache";
-
+//>
     private static readonly string ProjectRoot = GetProjectRoot();
 
     private static string GetProjectRoot()
@@ -48,7 +47,7 @@ class Program
     private static readonly HashSet<string> ReviewLogExcludedPages =
         new(StringComparer.OrdinalIgnoreCase)
         {
-            ""
+            "boinc"
         };
     private static readonly string ReviewLogPath =
     Path.Combine(
@@ -282,24 +281,28 @@ class Program
     {
         Console.OutputEncoding = Encoding.UTF8;
 
+        // 1. HELP ARGUMENT
         if (args.Contains("-h"))
         {
             Console.WriteLine(@"
                 ==============================
                 TRANSLATION TOOL - HELP
                 ==============================
-
-                -l | translating only one language | Example: -l zh
-                -p | Razor Page | -p seahorse or -p seahorse durian
-                -d | add directoty to path | -d city or -d city offices
-                -f | force overwrite cache, keep existing when used with -p | -f -p seahorse | only seahorse cache change
-
+                -l  | translating only one language | Example: -l zh
+                -p  | Razor Page | -p seahorse or -p seahorse durian
+                -d  | add directoty to path | -d city or -d city offices
+                -f  | force overwrite cache
+                -hl | hashleak scan: re-translates entries with Latin characters in non-Latin languages
                 ==============================
             ");
             return;
         }
 
+        // 2. PARSE ARGUMENTS
+        bool scanForLeakage = args.Contains("-hl");
         ForceOverwriteCache = args.Contains("-f");
+
+        if (scanForLeakage) Console.WriteLine("🔍 Script Leakage Scan mode enabled.\n");
 
         List<string> workingResxFolders = new() { ResxFolder };
 
@@ -465,6 +468,30 @@ class Program
                 CurrentCacheFile = Path.Combine(CacheFolder, $"cache_{lang}.json");
                 LoadCache();
 
+                // --- HASHLEAK (-hl) AUDIT WITH LOGGING ---
+                if (scanForLeakage)
+                {
+                    // Find everything that shouldn't be there
+                    var leakedEntries = Cache.Where(kvp => HasScriptLeakage(lang, kvp.Value)).ToList();
+
+                    if (leakedEntries.Any())
+                    {
+                        Console.WriteLine($"\n🔍 [Audit {lang}] Found {leakedEntries.Count} leaked entries:");
+                        
+                        foreach (var entry in leakedEntries)
+                        {
+                            // Show the user exactly what is being deleted
+                            Console.WriteLine($"   ❌ Purging Key: {entry.Key.Split("||").Last()} (Value: \"{entry.Value}\")");
+                            Cache.Remove(entry.Key);
+                        }
+                        Console.WriteLine($"♻️ Purge complete. These {leakedEntries.Count} items will be re-sent to AI.\n");
+                    }
+                    else
+                    {
+                        Console.WriteLine($"✅ [Audit {lang}] Cache is 100% clean. No leakage detected.");
+                    }
+                }
+
                 Console.WriteLine($"🌍 {lang} (Using: {activeModel})");
                 Console.WriteLine();
                 
@@ -481,8 +508,9 @@ class Program
                     var source = value.Value;
                     var key = data.Attribute("name")?.Value ?? "alt";
 
-                    // Pass the activeModel to the translation function
-                    var translated = await TranslateAsync(source, lang, key, pageName, activeModel);
+                    // Fetch the glossary for the current language to pass to the AI
+                    Glossaries.TryGetValue(lang, out var currentGlossary);
+                    var translated = await TranslateAsync(source, lang, key, pageName, activeModel, currentGlossary);
                     if (translated != null)
                     {
                         value.Value = translated;
@@ -509,38 +537,83 @@ class Program
         Console.ReadLine();
     }
 
+    private static async Task UnloadModelAsync(string modelName)
+    {
+        if (string.IsNullOrEmpty(modelName)) return;
+
+        try
+        {
+            var payload = new { model = modelName, keep_alive = 0 };
+            var content = new StringContent(JsonSerializer.Serialize(payload), Encoding.UTF8, "application/json");
+            
+            await Http.PostAsync(OllamaUrl, content);
+            
+            // Give the i7 and RAM a moment to settle after dropping 15GB+
+            Console.WriteLine($"\n🧠 CPU Memory Purged: {modelName}. Waiting for system to stabilize...");
+            await Task.Delay(3000); 
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"\n⚠ Could not flush CPU memory: {ex.Message}");
+        }
+    }
+
+    private static bool HasScriptLeakage(string lang, string text)
+    {
+        // 1. Only audit non-Latin script languages
+        string[] nonLatinLangs = { "km", "lo", "th", "ru", "hi", "zh", "ja", "ko" };
+        if (!nonLatinLangs.Contains(lang)) return false;
+
+        // 2. Remove invisible characters (ZWSP) that are common in Lao/Thai AI outputs
+        string scrubbed = Regex.Replace(text, @"[\u200B-\u200D\uFEFF]", "");
+
+        // 3. Scrub Global words (Case-Insensitive)
+        // We use Replace instead of a word-boundary Regex to ensure it catches 
+        // words even if they are touching Lao characters or punctuation.
+        foreach (var word in GlobalEchoExclusions)
+        {
+            scrubbed = Regex.Replace(scrubbed, Regex.Escape(word), "", RegexOptions.IgnoreCase);
+        }
+
+        // 4. Remove Language-Specific words
+        if (EchoExclusions.TryGetValue(lang, out var langSet))
+        {
+            foreach (var word in langSet)
+            {
+                scrubbed = Regex.Replace(scrubbed, Regex.Escape(word), "", RegexOptions.IgnoreCase);
+            }
+        }
+
+        // 5. Check if any Latin [A-Z] remain. If they do, it's a real leak.
+        return Regex.IsMatch(scrubbed, "[A-Za-z]|&");
+    }
+
     // ======================
     // TRANSLATE
     // ======================
-    private static async Task<string?> TranslateAsync(string text, string lang, string key, string pageName, string modelName)
+    private static async Task<string?> TranslateAsync(string text, string lang, string key, string pageName, string modelName, Dictionary<string, string>? glossary = null)
     {
-        // 1. KEY OVERRIDES (Hard-coded in Program.cs)
+        // Check for OVERRIDES first
         if (KeyOverrides.TryGetValue(lang, out var langOverrides) &&
             langOverrides.TryGetValue(key, out var fixedTranslation))
         {
-            Console.WriteLine($"🔒 [Override {lang} {key}] {text}\n➡️ {fixedTranslation}");
-            FinalLog.AppendLine($"{lang} {key} | {fixedTranslation}\n");
             return fixedTranslation;
         }
 
-        // 2. GLOSSARY CHECK (From glossary.json)
-        // We check if the 'key' (e.g., "welcome") exists for this language
-        if (Glossaries.TryGetValue(lang, out var glossary) && 
-            glossary.TryGetValue(key, out var glossaryValue))
+        // REMOVED: The local "if (Glossaries.TryGetValue...)" block that was causing Error CS0136.
+        // Instead, use the 'glossary' parameter passed into this method.
+        if (glossary != null && glossary.TryGetValue(key, out var glossaryValue))
         {
             Console.WriteLine($"📘 [Glossary Hit {lang} {key}] {text}\n➡️ {glossaryValue}");
             Console.WriteLine();
-            FinalLog.AppendLine($"{lang} {key} | {glossaryValue} (Glossary)\n");
-        
-            // Optional: Save to cache so the AI doesn't run if the glossary entry is removed later
+            
             var cleanTxt = text.Replace("\r", "").Replace("\n", " ").Trim();
             Cache[$"{lang}||{cleanTxt}"] = glossaryValue;
             SaveCache();
-        
+            
             return glossaryValue;
         }
 
-        // 3. CACHE CHECK
         string cleanText = text.Replace("\r", "").Replace("\n", " ").Trim();
         var cacheKey = $"{lang}||{cleanText}";
 
@@ -551,18 +624,22 @@ class Program
             return cached;
         }
 
+        // -------- NUMERIC PREPROCESS --------
+        var numericContext = NumericProcessor.Preprocess(text, lang);
+        string processedText = numericContext.ProcessedText;
+
         // ---------- UPDATED PAYLOAD FOR HARDWARE OPTIMIZATION ----------
         var payload = new
-        {
-            model = modelName, // Uses the model passed from the loop
-            prompt = BuildPrompt(text, lang),
-            options = new {
-                temperature = 0,
-                num_thread = 8,   // Fixes the 50% CPU usage by saturating physical cores
-                num_ctx = 4096    // Keeps memory bandwidth usage efficient
-            },
-            keep_alive = "5m" // Keeps the model ready for 5 minutes of inactivity
-        };
+            {
+                model = modelName,
+                prompt = BuildPrompt(processedText, lang, glossary),
+                options = new {
+                    temperature = 0,
+                    num_thread = 8,
+                    num_ctx = 4096
+                },
+                keep_alive = "5m"
+            };
 
         try
         {
@@ -589,7 +666,15 @@ class Program
 
             var translated = result.ToString().Trim();
 
-            // Remove leading/trailing quotes (standard, Czech, or German style)
+            // -------- NUMERIC POSTPROCESS --------
+            translated = NumericProcessor.Postprocess(translated, numericContext, lang);
+
+            translated = translated.Replace("\u200B", "");
+
+            // 1. Remove [meta] tags like [New lo meta] using Regex
+            translated = Regex.Replace(translated, @"\[.*?\]", "").Trim();
+
+            // 2. Existing quote cleaning
             char[] quotes = { '"', '„', '“', '”', '\'' };
             translated = translated.Trim(quotes);
 
@@ -644,17 +729,27 @@ class Program
     // ======================
     // PROMPT
     // ======================
-private static string BuildPrompt(string text, string lang)
+private static string BuildPrompt(string text, string lang, Dictionary<string, string>? glossary = null)
 {
     var langName = LangNames.GetValueOrDefault(lang, lang);
 
-    // --- 1. NUMERIC FORMATTING ---
+    string glossaryInstruction = "";
+    if (glossary != null)
+    {
+        var relevantTerms = glossary.Where(kvp => text.Contains(kvp.Key, StringComparison.OrdinalIgnoreCase)).ToList();
+        if (relevantTerms.Any())
+        {
+            var termsList = string.Join("\n", relevantTerms.Select(kvp => $"- {kvp.Key} -> {kvp.Value}"));
+            glossaryInstruction = $"\nCRITICAL GLOSSARY (Use these exact terms):\n{termsList}\n";
+        }
+    }
+
     string numberInstruction = lang switch
     {
-        "km" => "Translate all digits into Khmer numerals (០-៩). For years, use Khmer numerals in AD format (e.g., '2024' to '២០២៤').",
+        "km" => "Preserve all numeric values exactly. Display digits using Khmer numerals (០-៩), including years in AD format (e.g., '2024' becomes '២០២៤').",
         "zh" or "ja" => "Use Arabic numerals for years (e.g., '2024年'). For other numbers, use native characters if appropriate for formal context, otherwise maintain Arabic numerals.",
-        "th" => "Translate all digits into Thai numerals. Convert years to Buddhist Era (add 543) before translating digits.",
-        "lo" => "Translate all digits into Lao numerals (໐-໙). Convert years to Buddhist Era (add 543) before translating digits.",
+        "th" => "Preserve all numeric values exactly. Do NOT perform arithmetic or convert calendar systems. Display digits using Thai numerals (๐-๙).",
+        "lo" => "Preserve all numeric values exactly. Do NOT perform arithmetic or convert calendar systems. Display digits using Lao numerals (໐-໙).",
         "fr" or "de" or "it" or "es" or "pt" or "ru" or "sv" or "nl" or "cs" =>
             $"For {langName}: Use Arabic numerals. Use a space or dot for thousands and a comma for decimals (European style).",
         "vi" => "Use Arabic numerals: use a dot (.) for thousands and a comma (,) for decimals. For years, always include the word 'năm' (e.g., 'năm 2024').",
@@ -662,21 +757,12 @@ private static string BuildPrompt(string text, string lang)
         _ => "Maintain standard Arabic numerals and original numeric formatting."
     };
 
-    // --- 2. SCRIPT-SPECIFIC CONSTRAINTS (ZWSP for KM/LO) ---
-    string scriptInstruction = lang switch
-    {
-        "km" => "The output must be in Khmer Unicode. Use Zero Width Spaces (ZWSP) between words to ensure correct word wrapping in the UI.",
-        "lo" => "The output must be in Lao Unicode. Use Zero Width Spaces (ZWSP) between words to ensure correct word wrapping in the UI.",
-        _ => ""
-    };
-
-    // --- 3. STYLE & COMPOUND NOUNS (DE/NL/SV) ---
     string styleInstruction = lang switch
     {
         "de" or "nl" or "sv" => 
             $"- CRITICAL: Do NOT use hyphens (-) to join nouns. {langName} prefers compound words. " +
-            "Examples of WRONG: 'Kampot-Bus', 'Durian-Frucht'. " +
-            "Examples of CORRECT: 'Kampotbus', 'Durianfrucht'. " +
+            "Examples of WRONG: 'Bus-Station', 'Durian-Frucht'. " +
+            "Examples of CORRECT: 'Bus Station', 'Durianfrucht'. " +
             "If unsure, use a single space, NEVER a hyphen.",
         _ => ""
     };
@@ -686,14 +772,12 @@ You are a professional English translator to {langName} specializing in Software
 Translate UI strings and labels accurately, maintaining the original meaning and technical style.
 
 RULES:
+{glossaryInstruction}
 - {numberInstruction}
-- Translate symbols like '&' or '+' into the equivalent words in {langName} (e.g., 'and' or 'plus').
-{(string.IsNullOrWhiteSpace(scriptInstruction) ? "" : "- " + scriptInstruction)}
+- Translate symbols like '&' or '+' into the equivalent words in {langName}.
 {styleInstruction}
-- Keep translations concise to fit UI elements.
-- Do not add any punctuation at the end that is not present in the original text.
-- Produce ONLY the translation. No explanations or commentary.
-- Do NOT include any English words in the output unless they are proper nouns.
+- Produce ONLY the translation. No explanations or [meta] tags.
+- Do NOT include any English words in the output if a glossary translation is provided above.
 - The output must be fully written in {langName}.
 
 
@@ -791,17 +875,6 @@ SOURCE TEXT: "{text}"
         double similarity = (double)sameChars / Math.Max(s.Length, t.Length);
 
         return similarity > 0.9;
-    }
-
-    private static bool HasScriptLeakage(string lang, string text)
-    {
-        return lang switch
-        {
-            "km" or "lo" or "th" or "ru" or "hi" or "zh" or "ja" or "ko"
-                // Flags English letters [A-Za-z] OR the ampersand [&]
-                => Regex.IsMatch(text, "[A-Za-z]|&"), 
-            _ => false
-        };
     }
 
     private static bool IsEchoExcluded(string lang, string source, string translated)
@@ -940,25 +1013,101 @@ SOURCE TEXT: "{text}"
             Console.WriteLine($"⚠ Cache save error: {ex.Message}");
         }
     }
+    // ======================
+    // NUMERIC PROCESSOR
+    // ======================
 
-    private static async Task UnloadModelAsync(string modelName)
+    private class NumericContext
     {
-        if (string.IsNullOrEmpty(modelName)) return;
+        public string ProcessedText = "";
+        public Dictionary<string, string> Placeholders = new();
+    }
 
-        try
+    private static class NumericProcessor
+    {
+        public static NumericContext Preprocess(string text, string lang)
         {
-            var payload = new { model = modelName, keep_alive = 0 };
-            var content = new StringContent(JsonSerializer.Serialize(payload), Encoding.UTF8, "application/json");
-            
-            await Http.PostAsync(OllamaUrl, content);
-            
-            // Give the i7 and RAM a moment to settle after dropping 15GB+
-            Console.WriteLine($"\n🧠 CPU Memory Purged: {modelName}. Waiting for system to stabilize...");
-            await Task.Delay(3000); 
+            var context = new NumericContext();
+            var placeholders = new Dictionary<string, string>();
+            int counter = 0;
+
+            string processed = Regex.Replace(text, @"\b\d+\b", match =>
+            {
+                int number = int.Parse(match.Value);
+
+                // Thai BE conversion ONLY
+                if (lang == "th" && number >= 1000 && number <= 2099)
+                {
+                    number += 543;
+                }
+
+                string placeholder = $"__NUM{counter}__";
+                placeholders[placeholder] = number.ToString();
+                counter++;
+
+                return placeholder;
+            });
+
+            context.ProcessedText = processed;
+            context.Placeholders = placeholders;
+            return context;
         }
-        catch (Exception ex)
+
+        public static string Postprocess(string translated, NumericContext context, string lang)
         {
-            Console.WriteLine($"\n⚠ Could not flush CPU memory: {ex.Message}");
+            string result = translated;
+
+            foreach (var pair in context.Placeholders)
+            {
+                result = result.Replace(pair.Key, pair.Value);
+            }
+
+            if (lang == "th")
+                result = ConvertThaiDigits(result);
+
+            if (lang == "lo")
+                result = ConvertLaoDigits(result);
+
+            if (lang == "km")
+                result = ConvertKhmerDigits(result);
+
+            return result;
         }
+
+        private static string ConvertThaiDigits(string s) =>
+            s.Replace("0", "๐")
+             .Replace("1", "๑")
+             .Replace("2", "๒")
+             .Replace("3", "๓")
+             .Replace("4", "๔")
+             .Replace("5", "๕")
+             .Replace("6", "๖")
+             .Replace("7", "๗")
+             .Replace("8", "๘")
+             .Replace("9", "๙");
+
+        private static string ConvertLaoDigits(string s) =>
+            s.Replace("0", "໐")
+             .Replace("1", "໑")
+             .Replace("2", "໒")
+             .Replace("3", "໓")
+             .Replace("4", "໔")
+             .Replace("5", "໕")
+             .Replace("6", "໖")
+             .Replace("7", "໗")
+             .Replace("8", "໘")
+             .Replace("9", "໙");
+
+        private static string ConvertKhmerDigits(string s) =>
+            s.Replace("0", "០")
+             .Replace("1", "១")
+             .Replace("2", "២")
+             .Replace("3", "៣")
+             .Replace("4", "៤")
+             .Replace("5", "៥")
+             .Replace("6", "៦")
+             .Replace("7", "៧")
+             .Replace("8", "៨")
+             .Replace("9", "៩");
     }
 }

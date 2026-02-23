@@ -1,15 +1,6 @@
 <h1>ResxForge</h1>
 
 <p>
-<strong>Open <code>Program.cs</code> and update the paths below to match your folder structure:</strong>
-</p>
-<pre>
-private const string ResxFolder = @"C:\Users\xxx\source\repos\ResxForge\Resources";
-private const string ConfigFolder = @"C:\Users\xxx\source\repos\ResxForge\config";
-private const string CacheFolder = @"C:\Users\xxx\source\repos\ResxForge\cache";
-</pre>
-
-<p>
 <strong>Deterministic, glossary-aware localization pipeline for <code>.resx</code> files powered by local LLMs (via Ollama).</strong>
 </p>
 
@@ -103,6 +94,12 @@ private const string CacheFolder = @"C:\YourPath\cache";</code></pre>
 
 <div class="section">
 <h2>Configuration</h2>
+<p><strong>Step 1:</strong> Open <code>Program.cs</code> in the project.<br><br>
+<strong>Step 2:</strong> Find the three lines below.
+Remove the <code>//</code> at the beginning of each line to uncomment them.<br><br>
+<strong>Step 3:</strong> Make sure the folder paths point to locations <em>outside</em> this repository on your computer (for example, a folder in your Documents or another workspace).<br><br>
+<strong>Step 4:</strong> Delete the block of code between the <code>//></code> and <code>//<</code> markers.
+
 <h3>Glossary (Hard-Replacement)</h3>
 <p>Location: <code>/config/glossary.json</code></p>
 <p>Unlike standard prompts, ResxForge performs C#-level glossary replacement <em>before</em> hitting the AI, ensuring 100% accuracy and zero latency for known terms.</p>
