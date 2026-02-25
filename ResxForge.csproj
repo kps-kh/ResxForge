@@ -21,6 +21,9 @@
     <Compile Include="Program-batch-parallel.cs" />
   </ItemGroup>
   <ItemGroup>
+    <Compile Include="PromptService.cs" />
+  </ItemGroup>
+  <ItemGroup>
     <Folder Include="cache\" />
   </ItemGroup>
 

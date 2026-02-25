@@ -1,8 +1,10 @@
 ﻿using System.Diagnostics;
 using System.Text;
 using System.Text.Json;
-using System.Xml.Linq;
 using System.Text.RegularExpressions;
+using System.Xml.Linq;
+
+namespace ResxForge;
 
 class Program
 {
@@ -12,7 +14,8 @@ class Program
 
     private static string OllamaModel = "aisingapore/Gemma-SEA-LION-v4-27B-IT:latest";
     private const string OllamaUrl = "http://127.0.0.1:11434/api/generate";
-    private const string Excluded = "";
+    private static readonly HashSet<string> Excluded =
+        new(StringComparer.OrdinalIgnoreCase) { "AccommodationsFolder", "RestaurantsFolder" };
     //private const string ResxFolder = @"C:\Users\xxx\source\repos\ResxForge\Resources";
     //private const string ConfigFolder = @"C:\Users\xxx\source\repos\ResxForge\config";
     //private const string CacheFolder = @"C:\Users\xxx\source\repos\ResxForge\cache";
@@ -90,7 +93,7 @@ class Program
 
     private static IReadOnlyList<string> TargetLangs => Languages.Where(l => l != "en").ToList();
 
-    private static readonly Dictionary<string, string> LangNames = new()
+    internal static readonly Dictionary<string, string> LangNames = new()
     {
         ["km"] = "Khmer",
         ["zh"] = "Simplified Chinese",
@@ -135,11 +138,8 @@ class Program
 
     private static FileSystemWatcher? GlossaryWatcher;
     private static FileSystemWatcher? EchoWatcher;
+    private static Dictionary<string, HashSet<string>> GlossarySnapshot = new(StringComparer.OrdinalIgnoreCase);
 
-
-    // ======================
-    // GLOSSARY CONFIG
-    // ======================
     private static Dictionary<string, Dictionary<string, string>> Glossaries =
         new(StringComparer.OrdinalIgnoreCase);
 
@@ -150,23 +150,97 @@ class Program
     {
         try
         {
-            if (!File.Exists(GlossaryPath))
-            {
-                Console.WriteLine("⚠ glossary.json not found.");
-                return;
-            }
+            if (!File.Exists(GlossaryPath)) return;
 
             var json = File.ReadAllText(GlossaryPath);
+            var newGlossaries = JsonSerializer.Deserialize<Dictionary<string, Dictionary<string, string>>>(json) ?? new();
 
-            Glossaries = JsonSerializer.Deserialize<
-                Dictionary<string, Dictionary<string, string>>
-            >(json) ?? new();
+            foreach (var langEntry in newGlossaries)
+            {
+                string lang = langEntry.Key;
+                var currentRules = langEntry.Value;
 
-            Console.WriteLine("📘 glossary.json loaded.");
+                if (!GlossarySnapshot.ContainsKey(lang))
+                {
+                    GlossarySnapshot[lang] = new HashSet<string>(currentRules.Keys, StringComparer.OrdinalIgnoreCase);
+                    continue;
+                }
+
+                var newKeysForThisLang = currentRules.Keys
+                    .Where(k => !GlossarySnapshot[lang].Contains(k))
+                    .ToList();
+
+                if (newKeysForThisLang.Any())
+                {
+                    PatchSpecificCache(lang, newKeysForThisLang, currentRules);
+
+                    foreach (var key in newKeysForThisLang)
+                    {
+                        GlossarySnapshot[lang].Add(key);
+                    }
+                }
+            }
+
+            Glossaries = newGlossaries;
+            Console.WriteLine("📘 glossary.json synchronized.");
         }
         catch (Exception ex)
         {
-            Console.WriteLine($"⚠ Glossary load failed: {ex.Message}");
+            Console.WriteLine($"⚠ Glossary hot-reload failed: {ex.Message}");
+        }
+    }
+
+    private static void PatchSpecificCache(string lang, List<string> newKeys, Dictionary<string, string> rules)
+    {
+        string cachePath = Path.Combine(CacheFolder, $"cache_{lang}.json");
+        if (!File.Exists(cachePath)) return;
+
+        try
+        {
+            var cacheJson = File.ReadAllText(cachePath);
+            var targetCache = JsonSerializer.Deserialize<Dictionary<string, string>>(cacheJson) ?? new();
+            
+            var pendingChanges = new Dictionary<string, string>();
+
+            foreach (var englishTerm in newKeys)
+            {
+                string translation = rules[englishTerm];
+                var matches = targetCache.Where(kvp => kvp.Value.Contains(englishTerm, StringComparison.OrdinalIgnoreCase)).ToList();
+
+                foreach (var match in matches)
+                {
+                    string updatedValue = match.Value.Replace(englishTerm, translation, StringComparison.OrdinalIgnoreCase);
+                    if (match.Value != updatedValue)
+                    {
+                        pendingChanges[match.Key] = updatedValue;
+                    }
+                }
+            }
+
+            if (pendingChanges.Count > 0)
+            {
+                foreach (var change in pendingChanges)
+                {
+                    targetCache[change.Key] = change.Value;
+                }
+
+                var options = new JsonSerializerOptions { 
+                    WriteIndented = true, 
+                    Encoder = System.Text.Encodings.Web.JavaScriptEncoder.UnsafeRelaxedJsonEscaping 
+                };
+                File.WriteAllText(cachePath, JsonSerializer.Serialize(targetCache, options), Encoding.UTF8);
+
+                if (CurrentCacheFile.EndsWith($"cache_{lang}.json", StringComparison.OrdinalIgnoreCase))
+                {
+                    Cache = targetCache;
+                }
+                
+                Console.WriteLine($"✅ {lang}: {pendingChanges.Count} entries updated.\n");
+            }
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"⚠ Failed to patch {lang} cache: {ex.Message}");
         }
     }
 
@@ -222,7 +296,7 @@ class Program
     }
 
     // ======================
-    // GENERIC HOT RELOAD (DEBOUNCED)
+    // GENERIC HOT RELOAD 
     // ======================
     private static void StartHotReload(
         string filePath,
@@ -244,7 +318,6 @@ class Program
 
             watcher.Changed += (_, __) =>
             {
-                // Debounce rapid events
                 timer?.Dispose();
                 timer = new Timer(_ =>
                 {
@@ -281,7 +354,6 @@ class Program
     {
         Console.OutputEncoding = Encoding.UTF8;
 
-        // 1. HELP ARGUMENT
         if (args.Contains("-h"))
         {
             Console.WriteLine(@"
@@ -298,7 +370,6 @@ class Program
             return;
         }
 
-        // 2. PARSE ARGUMENTS
         bool scanForLeakage = args.Contains("-hl");
         ForceOverwriteCache = args.Contains("-f");
 
@@ -315,7 +386,6 @@ class Program
             {
                 var inputDir = args[i];
 
-                // Find matching subdirectory (case-insensitive)
                 var match = Directory
                     .GetDirectories(ResxFolder)
                     .FirstOrDefault(d =>
@@ -335,7 +405,6 @@ class Program
                 }
             }
 
-            // Fallback if no valid dirs found
             if (!workingResxFolders.Any())
                 workingResxFolders.Add(ResxFolder);
         }
@@ -356,11 +425,9 @@ class Program
                 Console.WriteLine($"📌 Translating only resources: {string.Join(", ", specificResources)}");
         }
 
-        // Ensure cache/config folders exist
         Directory.CreateDirectory(CacheFolder);
         Directory.CreateDirectory(ConfigFolder);
 
-        // Load JSON configs
         LoadGlossary();
         LoadEchoConfig();
 
@@ -376,7 +443,6 @@ class Program
             LoadEchoConfig,
             "echo.json");
 
-        // Multi-language override
         List<string> targetLangs = TargetLangs.ToList();
         var langArgIndex = Array.FindIndex(args, a => a == "-l");
 
@@ -423,10 +489,20 @@ class Program
             baseFiles.AddRange(
                 Directory.EnumerateFiles(folder, "*.resx", SearchOption.AllDirectories)
                 .Where(f =>
-                    string.IsNullOrWhiteSpace(Excluded) ||
-                    !f.Split(Path.DirectorySeparatorChar)
-                    .Any(dir => dir.Equals(Excluded, StringComparison.OrdinalIgnoreCase))
-                )
+                {
+                    var dir = Path.GetDirectoryName(f);
+
+                    while (!string.IsNullOrEmpty(dir))
+                    {
+                        var folderName = Path.GetFileName(dir);
+                        if (Excluded.Contains(folderName))
+                            return false;
+
+                        dir = Path.GetDirectoryName(dir);
+                    }
+
+                    return true;
+                })
                 .Where(f =>
                     !Languages.Any(l => f.EndsWith($".{l}.resx", StringComparison.OrdinalIgnoreCase))
                 )
@@ -471,7 +547,6 @@ class Program
                 // --- HASHLEAK (-hl) AUDIT WITH LOGGING ---
                 if (scanForLeakage)
                 {
-                    // Find everything that shouldn't be there
                     var leakedEntries = Cache.Where(kvp => HasScriptLeakage(lang, kvp.Value)).ToList();
 
                     if (leakedEntries.Any())
@@ -480,7 +555,6 @@ class Program
                         
                         foreach (var entry in leakedEntries)
                         {
-                            // Show the user exactly what is being deleted
                             Console.WriteLine($"   ❌ Purging Key: {entry.Key.Split("||").Last()} (Value: \"{entry.Value}\")");
                             Cache.Remove(entry.Key);
                         }
@@ -499,21 +573,28 @@ class Program
 
                 var newDoc = new XDocument(baseDoc);
 
+                var sessionGlossary = Glossaries.TryGetValue(lang, out var g) 
+                    ? new Dictionary<string, string>(g, StringComparer.OrdinalIgnoreCase) 
+                    : new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+
                 foreach (var data in newDoc.Descendants("data"))
                 {
                     var value = data.Element("value");
-                    if (value == null || string.IsNullOrWhiteSpace(value.Value))
-                        continue;
+                    if (value == null || string.IsNullOrWhiteSpace(value.Value)) continue;
 
                     var source = value.Value;
                     var key = data.Attribute("name")?.Value ?? "alt";
 
-                    // Fetch the glossary for the current language to pass to the AI
-                    Glossaries.TryGetValue(lang, out var currentGlossary);
-                    var translated = await TranslateAsync(source, lang, key, pageName, activeModel, currentGlossary);
+                    var translated = await TranslateAsync(source, lang, key, pageName, activeModel, sessionGlossary);
+                    
                     if (translated != null)
                     {
                         value.Value = translated;
+
+                         if (source.Split(' ').Length < 5 && !sessionGlossary.ContainsKey(source))
+                        {
+                            sessionGlossary[source] = translated; 
+                        }
                     }
                 }
 
@@ -548,7 +629,6 @@ class Program
             
             await Http.PostAsync(OllamaUrl, content);
             
-            // Give the i7 and RAM a moment to settle after dropping 15GB+
             Console.WriteLine($"\n🧠 CPU Memory Purged: {modelName}. Waiting for system to stabilize...");
             await Task.Delay(3000); 
         }
@@ -560,22 +640,16 @@ class Program
 
     private static bool HasScriptLeakage(string lang, string text)
     {
-        // 1. Only audit non-Latin script languages
         string[] nonLatinLangs = { "km", "lo", "th", "ru", "hi", "zh", "ja", "ko" };
         if (!nonLatinLangs.Contains(lang)) return false;
 
-        // 2. Remove invisible characters (ZWSP) that are common in Lao/Thai AI outputs
-        string scrubbed = Regex.Replace(text, @"[\u200B-\u200D\uFEFF]", "");
+        string scrubbed = PromptService.SanitizeOutput(text);
 
-        // 3. Scrub Global words (Case-Insensitive)
-        // We use Replace instead of a word-boundary Regex to ensure it catches 
-        // words even if they are touching Lao characters or punctuation.
         foreach (var word in GlobalEchoExclusions)
         {
             scrubbed = Regex.Replace(scrubbed, Regex.Escape(word), "", RegexOptions.IgnoreCase);
         }
 
-        // 4. Remove Language-Specific words
         if (EchoExclusions.TryGetValue(lang, out var langSet))
         {
             foreach (var word in langSet)
@@ -584,24 +658,20 @@ class Program
             }
         }
 
-        // 5. Check if any Latin [A-Z] remain. If they do, it's a real leak.
         return Regex.IsMatch(scrubbed, "[A-Za-z]|&");
     }
 
     // ======================
     // TRANSLATE
     // ======================
-    private static async Task<string?> TranslateAsync(string text, string lang, string key, string pageName, string modelName, Dictionary<string, string>? glossary = null)
+    private static async Task<string?> TranslateAsync( string text, string lang, string key, string pageName, string modelName, Dictionary<string, string>? glossary = null ) 
     {
-        // Check for OVERRIDES first
         if (KeyOverrides.TryGetValue(lang, out var langOverrides) &&
             langOverrides.TryGetValue(key, out var fixedTranslation))
         {
             return fixedTranslation;
         }
 
-        // REMOVED: The local "if (Glossaries.TryGetValue...)" block that was causing Error CS0136.
-        // Instead, use the 'glossary' parameter passed into this method.
         if (glossary != null && glossary.TryGetValue(key, out var glossaryValue))
         {
             Console.WriteLine($"📘 [Glossary Hit {lang} {key}] {text}\n➡️ {glossaryValue}");
@@ -624,15 +694,15 @@ class Program
             return cached;
         }
 
-        // -------- NUMERIC PREPROCESS --------
-        var numericContext = NumericProcessor.Preprocess(text, lang);
+        var numericContext = PromptService.NumericProcessor.Preprocess(text, lang);
         string processedText = numericContext.ProcessedText;
 
-        // ---------- UPDATED PAYLOAD FOR HARDWARE OPTIMIZATION ----------
+        var langName = LangNames.GetValueOrDefault(lang, lang);
+        
         var payload = new
             {
                 model = modelName,
-                prompt = BuildPrompt(processedText, lang, glossary),
+                prompt = PromptService.BuildPrompt(processedText, lang, langName, glossary),
                 options = new {
                     temperature = 0,
                     num_thread = 8,
@@ -664,28 +734,18 @@ class Program
                 catch { }
             }
 
-            var translated = result.ToString().Trim();
+            var translated = result.ToString();
 
-            // -------- NUMERIC POSTPROCESS --------
-            translated = NumericProcessor.Postprocess(translated, numericContext, lang);
+            translated = PromptService.NumericProcessor.Postprocess(translated, numericContext, lang);
 
-            translated = translated.Replace("\u200B", "");
+            translated = PromptService.SanitizeOutput(translated);
 
-            // 1. Remove [meta] tags like [New lo meta] using Regex
-            translated = Regex.Replace(translated, @"\[.*?\]", "").Trim();
-
-            // 2. Existing quote cleaning
-            char[] quotes = { '"', '„', '“', '”', '\'' };
-            translated = translated.Trim(quotes);
-
-            // If the source is a single line but the AI dumped a whole list (like your 'Questions and answers' dump)
             if (!text.Contains("\n") && translated.Contains("\n"))
             {
-                // Harvest only the first non-empty line
-                var lines = translated.Split(new[] { '\r', '\n' }, StringSplitOptions.RemoveEmptyEntries);
-                var firstLine = lines.FirstOrDefault(l => !string.IsNullOrWhiteSpace(l))?.Trim();
+                var firstLine = translated.Split('\n')
+                                          .FirstOrDefault(l => !string.IsNullOrWhiteSpace(l))?
+                                          .Trim();
 
-                // If the first line is just the key repeated or a header, try to find the actual translation
                 if (!string.IsNullOrEmpty(firstLine))
                 {
                     translated = firstLine;
@@ -698,7 +758,6 @@ class Program
                 translated = translated.TrimEnd('.', '!', '?');
             }
 
-            // Logic for Echo/Leakage detection remains the same...
             bool echo = IsEnglishEcho(text, translated);
             bool leak = HasScriptLeakage(lang, translated);
 
@@ -725,66 +784,6 @@ class Program
             return null;
         }
     }
-
-    // ======================
-    // PROMPT
-    // ======================
-private static string BuildPrompt(string text, string lang, Dictionary<string, string>? glossary = null)
-{
-    var langName = LangNames.GetValueOrDefault(lang, lang);
-
-    string glossaryInstruction = "";
-    if (glossary != null)
-    {
-        var relevantTerms = glossary.Where(kvp => text.Contains(kvp.Key, StringComparison.OrdinalIgnoreCase)).ToList();
-        if (relevantTerms.Any())
-        {
-            var termsList = string.Join("\n", relevantTerms.Select(kvp => $"- {kvp.Key} -> {kvp.Value}"));
-            glossaryInstruction = $"\nCRITICAL GLOSSARY (Use these exact terms):\n{termsList}\n";
-        }
-    }
-
-    string numberInstruction = lang switch
-    {
-        "km" => "Preserve all numeric values exactly. Display digits using Khmer numerals (០-៩), including years in AD format (e.g., '2024' becomes '២០២៤').",
-        "zh" or "ja" => "Use Arabic numerals for years (e.g., '2024年'). For other numbers, use native characters if appropriate for formal context, otherwise maintain Arabic numerals.",
-        "th" => "Preserve all numeric values exactly. Do NOT perform arithmetic or convert calendar systems. Display digits using Thai numerals (๐-๙).",
-        "lo" => "Preserve all numeric values exactly. Do NOT perform arithmetic or convert calendar systems. Display digits using Lao numerals (໐-໙).",
-        "fr" or "de" or "it" or "es" or "pt" or "ru" or "sv" or "nl" or "cs" =>
-            $"For {langName}: Use Arabic numerals. Use a space or dot for thousands and a comma for decimals (European style).",
-        "vi" => "Use Arabic numerals: use a dot (.) for thousands and a comma (,) for decimals. For years, always include the word 'năm' (e.g., 'năm 2024').",
-        "hi" => "Use standard Arabic numerals (0-9). Devanagari numerals are not required for this modern UI context.",
-        _ => "Maintain standard Arabic numerals and original numeric formatting."
-    };
-
-    string styleInstruction = lang switch
-    {
-        "de" or "nl" or "sv" => 
-            $"- CRITICAL: Do NOT use hyphens (-) to join nouns. {langName} prefers compound words. " +
-            "Examples of WRONG: 'Bus-Station', 'Durian-Frucht'. " +
-            "Examples of CORRECT: 'Bus Station', 'Durianfrucht'. " +
-            "If unsure, use a single space, NEVER a hyphen.",
-        _ => ""
-    };
-
-return $"""
-You are a professional English translator to {langName} specializing in Software Resource Files (.resx).
-Translate UI strings and labels accurately, maintaining the original meaning and technical style.
-
-RULES:
-{glossaryInstruction}
-- {numberInstruction}
-- Translate symbols like '&' or '+' into the equivalent words in {langName}.
-{styleInstruction}
-- Produce ONLY the translation. No explanations or [meta] tags.
-- Do NOT include any English words in the output if a glossary translation is provided above.
-- The output must be fully written in {langName}.
-
-
-SOURCE TEXT: "{text}"
-{langName} TRANSLATION: "
-""";
-}
 
     // ======================
     // CHECK / START OLLAMA
@@ -853,7 +852,7 @@ SOURCE TEXT: "{text}"
             {
                 Console.WriteLine("🛑 Stopping Ollama server...");
                 OllamaProcess.Kill();
-                OllamaProcess.WaitForExit(3000); // optional wait for cleanup
+                OllamaProcess.WaitForExit(3000);
             }
         }
         catch { }
@@ -919,7 +918,6 @@ SOURCE TEXT: "{text}"
     // ======================
     // FINAL LOG
     // ======================
-
     private static void WriteFinalLog(List<string> folders, List<string>? resources)
     {
         try
@@ -959,7 +957,6 @@ SOURCE TEXT: "{text}"
     // ======================
     private static void LoadCache()
     {
-        // Initialize with OrdinalIgnoreCase so "Kampot" matches "kampot"
         Cache = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
 
         if (!string.IsNullOrEmpty(CurrentCacheFile) && File.Exists(CurrentCacheFile))
@@ -971,10 +968,8 @@ SOURCE TEXT: "{text}"
 
                 if (loaded != null)
                 {
-                    // We must move items into the Case-Insensitive dictionary
                     foreach (var kvp in loaded)
                     {
-                        // Clean the key (remove newlines/tabs) while loading
                         string cleanKey = kvp.Key.Replace("\r", "").Replace("\n", " ").Trim();
                         Cache[cleanKey] = kvp.Value;
                     }
@@ -1002,112 +997,15 @@ SOURCE TEXT: "{text}"
             var options = new JsonSerializerOptions
             {
                 WriteIndented = true,
-                // CRITICAL: Keeps Japanese/Vietnamese characters readable in the file
                 Encoder = System.Text.Encodings.Web.JavaScriptEncoder.UnsafeRelaxedJsonEscaping
             };
 
-            File.WriteAllText(CurrentCacheFile, JsonSerializer.Serialize(Cache, options), Encoding.UTF8);
+            string json = JsonSerializer.Serialize(Cache, options);
+            File.WriteAllText(CurrentCacheFile, json, Encoding.UTF8);
         }
         catch (Exception ex)
         {
             Console.WriteLine($"⚠ Cache save error: {ex.Message}");
         }
-    }
-    // ======================
-    // NUMERIC PROCESSOR
-    // ======================
-
-    private class NumericContext
-    {
-        public string ProcessedText = "";
-        public Dictionary<string, string> Placeholders = new();
-    }
-
-    private static class NumericProcessor
-    {
-        public static NumericContext Preprocess(string text, string lang)
-        {
-            var context = new NumericContext();
-            var placeholders = new Dictionary<string, string>();
-            int counter = 0;
-
-            string processed = Regex.Replace(text, @"\b\d+\b", match =>
-            {
-                int number = int.Parse(match.Value);
-
-                // Thai BE conversion ONLY
-                if (lang == "th" && number >= 1000 && number <= 2099)
-                {
-                    number += 543;
-                }
-
-                string placeholder = $"__NUM{counter}__";
-                placeholders[placeholder] = number.ToString();
-                counter++;
-
-                return placeholder;
-            });
-
-            context.ProcessedText = processed;
-            context.Placeholders = placeholders;
-            return context;
-        }
-
-        public static string Postprocess(string translated, NumericContext context, string lang)
-        {
-            string result = translated;
-
-            foreach (var pair in context.Placeholders)
-            {
-                result = result.Replace(pair.Key, pair.Value);
-            }
-
-            if (lang == "th")
-                result = ConvertThaiDigits(result);
-
-            if (lang == "lo")
-                result = ConvertLaoDigits(result);
-
-            if (lang == "km")
-                result = ConvertKhmerDigits(result);
-
-            return result;
-        }
-
-        private static string ConvertThaiDigits(string s) =>
-            s.Replace("0", "๐")
-             .Replace("1", "๑")
-             .Replace("2", "๒")
-             .Replace("3", "๓")
-             .Replace("4", "๔")
-             .Replace("5", "๕")
-             .Replace("6", "๖")
-             .Replace("7", "๗")
-             .Replace("8", "๘")
-             .Replace("9", "๙");
-
-        private static string ConvertLaoDigits(string s) =>
-            s.Replace("0", "໐")
-             .Replace("1", "໑")
-             .Replace("2", "໒")
-             .Replace("3", "໓")
-             .Replace("4", "໔")
-             .Replace("5", "໕")
-             .Replace("6", "໖")
-             .Replace("7", "໗")
-             .Replace("8", "໘")
-             .Replace("9", "໙");
-
-        private static string ConvertKhmerDigits(string s) =>
-            s.Replace("0", "០")
-             .Replace("1", "១")
-             .Replace("2", "២")
-             .Replace("3", "៣")
-             .Replace("4", "៤")
-             .Replace("5", "៥")
-             .Replace("6", "៦")
-             .Replace("7", "៧")
-             .Replace("8", "៨")
-             .Replace("9", "៩");
     }
 }
