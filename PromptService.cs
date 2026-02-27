@@ -4,8 +4,9 @@ namespace Translate;
 
 internal static class PromptService
 {
-    internal static string BuildPrompt(string text, string lang, string langName, Dictionary<string, string>? glossary = null)
+    internal static string BuildPrompt(string text, string lang, string langName, Dictionary<string, string> cache, Dictionary<string, string>? glossary = null)
     {
+        string historyInstruction = GetHistoryContext(text, lang, cache);
         string glossaryInstruction = GetGlossaryInstruction(text, glossary);
         string numberInstruction = GetNumberInstruction(lang, langName);
         string styleInstruction = GetStyleInstruction(lang, langName);
@@ -16,14 +17,16 @@ You are a professional English translator to {langName} specializing in Software
 Translate UI strings and labels accurately, maintaining the original meaning and technical style.
 
 RULES:
+{historyInstruction}
 {glossaryInstruction}
 - {numberInstruction}
-- Translate symbols like '&' or '+' into the equivalent words in {langName}.
 {styleInstruction}
+- CRITICAL: Keep the translation length similar to the source text to prevent UI overflow.
+- If the source is a single word or short phrase, the translation MUST also be short.
+- Translate symbols like '&' or '+' into the equivalent words in {langName}.
 - Produce ONLY the translation. No explanations or [meta] tags.
-- NO conversational filler (e.g., "Sure", "Here is the translation").
+- NO conversational filler.
 - NO quotation marks.
-- Do NOT include any English words in the output if a glossary translation is provided above.
 - The output must be fully written in {langName}.
 [/INST]
 
@@ -31,11 +34,48 @@ RULES:
 {text}
 """;
     }
-    internal static string GetGlossaryInstruction(string text, Dictionary<string, string>? glossary)
-    {
-        if (glossary == null) return "";
 
-        var relevantTerms = glossary
+    private static string GetHistoryContext(string text, string lang, Dictionary<string, string> cache)
+        {
+            var langPrefix = $"{lang}||";
+            
+            var examples = cache
+                .Where(kvp => kvp.Key.StartsWith(langPrefix))
+                .Select(kvp => new { 
+                    Original = kvp.Key.Replace(langPrefix, ""), 
+                    Translated = kvp.Value 
+                })
+
+                .Where(x => IsRelevant(text, x.Original))
+                .Take(3)
+                .Select(x => $"- Source: {x.Original} -> Translation: {x.Translated}")
+                .ToList();
+
+            if (!examples.Any()) return "";
+
+            return $"\nREFERENCE EXAMPLES (Maintain this style and terminology):\n{string.Join("\n", examples)}\n";
+        }
+
+    private static bool IsRelevant(string currentText, string cachedKey)
+    {
+
+        if (currentText.Contains(cachedKey, StringComparison.OrdinalIgnoreCase)) return true;
+
+        if (currentText.Length > 15)
+        {
+            var currentWords = currentText.Split(' ').Where(w => w.Length > 3).ToHashSet();
+            var cachedWords = cachedKey.Split(' ').Where(w => w.Length > 3).ToHashSet();
+            return currentWords.Intersect(cachedWords).Count() >= 2;
+        }
+        return false;
+    }
+
+    internal static string GetGlossaryInstruction(string text, Dictionary<string, string>? langGlossary)
+    {
+
+        if (langGlossary == null) return "";
+
+        var relevantTerms = langGlossary
             .Where(kvp => text.Contains(kvp.Key, StringComparison.OrdinalIgnoreCase))
             .ToList();
 
@@ -47,12 +87,14 @@ RULES:
 
     internal static string GetNumberInstruction(string lang, string langName) => lang switch
     {
-        "km" => "Preserve all numeric values exactly. Display digits using Khmer numerals (០-៩), including years in AD format (e.g., '2024' becomes '២០២៤').",
+        "km" => "Use Khmer numerals (០-៩) ONLY for dates and years (e.g., '២០២៦'). For all other technical values, prices, and IDs, maintain Arabic numerals (0-9). Do NOT perform arithmetic or convert calendar systems.",
         "zh" or "ja" => "Use Arabic numerals for years (e.g., '2024年'). For other numbers, use native characters if appropriate for formal context, otherwise maintain Arabic numerals.",
         "th" => "Preserve all numeric values exactly. Do NOT perform arithmetic or convert calendar systems. Display digits using Thai numerals (๐-๙).",
         "lo" => "Preserve all numeric values exactly. Do NOT perform arithmetic or convert calendar systems. Display digits using Lao numerals (໐-໙).",
-        "fr" or "de" or "it" or "es" or "pt" or "ru" or "sv" or "nl" or "cs" =>
-            $"For {langName}: Use Arabic numerals. Use a space or dot for thousands and a comma for decimals (European style).",
+        "sv" => 
+            $"For {langName}: Use Arabic numerals. Use a space for thousands and a comma for decimals (e.g., 1 234,56).",
+        "fr" or "de" or "it" or "es" or "pt" or "ru" or "nl" or "cs" =>
+            $"For {langName}: Use Arabic numerals. Use a dot (.) for thousands and a comma (,) for decimals (e.g., 1.234,56).",
         "vi" => "Use Arabic numerals: use a dot (.) for thousands and a comma (,) for decimals. For years, always include the word 'năm' (e.g., 'năm 2024').",
         "hi" => "Use standard Arabic numerals (0-9). Devanagari numerals are not required for this modern UI context.",
         _ => "Maintain standard Arabic numerals and original numeric formatting."

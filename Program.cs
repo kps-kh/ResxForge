@@ -5,19 +5,9 @@ using System.Xml.Linq;
 using System.Text.RegularExpressions;
 
 namespace Translate;
+
 class Program
 {
-    private static string ModelSEA = "aisingapore/Gemma-SEA-LION-v4-27B-IT:latest";
-    private static string ModelEU = "translategemma:27b";
-    private const string OllamaBaseUrl = "http://127.0.0.1:11434"; 
-    private static string OllamaGenerateUrl => $"{OllamaBaseUrl}/api/generate";
-    private static string OllamaTagsUrl => $"{OllamaBaseUrl}/api/tags";
-
-    private static readonly HashSet<string> Excluded = new(StringComparer.OrdinalIgnoreCase) { "AccommodationsFolder", "RestaurantsFolder" };
-
-    private static readonly string ReviewLogPath = Path.Combine( Environment.GetFolderPath(Environment.SpecialFolder.Desktop), "review.log" );
-    private static readonly HashSet<string> ReviewLogExcludedPages = new(StringComparer.OrdinalIgnoreCase)  { "boinc" };
-
     //private const string ResxFolder = @"C:\Users\xxx\source\repos\ResxForge\Resources";
     //private const string ConfigFolder = @"C:\Users\xxx\source\repos\ResxForge\config";
     //private const string CacheFolder = @"C:\Users\xxx\source\repos\ResxForge\cache";
@@ -49,68 +39,35 @@ class Program
     private static readonly string ResxFolder =
         Path.Combine(ProjectRoot, "Resources");
 //>
+    private static string ModelSEA = "aisingapore/Gemma-SEA-LION-v4-27B-IT:latest";
+    private static string ModelEU = "translategemma:27b";
+    private const string OllamaBaseUrl = "http://127.0.0.1:11434"; 
+    private static string OllamaGenerateUrl => $"{OllamaBaseUrl}/api/generate";
+    private static string OllamaTagsUrl => $"{OllamaBaseUrl}/api/tags";
     private static string GlossaryPath = Path.Combine(ConfigFolder, "glossary.json");
     private static string EchoPath = Path.Combine(ConfigFolder, "echo.json");
 
-    private static readonly StringBuilder FinalLog = new();
-    private static readonly HttpClient Http = new()
-    {
-        Timeout = TimeSpan.FromMinutes(15)
-    };
+    private static readonly HashSet<string> Excluded = new(StringComparer.OrdinalIgnoreCase) { "AccommodationsFolder", "RestaurantsFolder", "Districts" };
 
-    private static Process? OllamaProcess;
-    private static bool ForceOverwriteCache = false;
+    private static readonly string ReviewLogPath = Path.Combine( Environment.GetFolderPath(Environment.SpecialFolder.Desktop), "review.log" );
+    private static readonly HashSet<string> ReviewLogExcludedPages = new(StringComparer.OrdinalIgnoreCase)  { "boinc" };
 
-    static Program()
-    {
-        AppDomain.CurrentDomain.ProcessExit += (s, e) => StopOllama();
-        Console.CancelKeyPress += (s, e) =>
-        {
-            StopOllama();
-            Environment.Exit(0); 
-        };
-    }
-
-    // ======================
-    // LANGUAGES
-    // ======================
     private static readonly List<string> Languages = new()
     {
-        // === GROUP 1: ModelSEA ===
-        "km", "zh", "vi", "th", "ja", "lo", "ko", "id", "ms",
-
-        // === GROUP 2: ModelEU ===
-        "fr", "de", "es", "nl", "it", "pt", "cs", "sv", "ru", "hi"
+        "km", "zh", "vi", "th", "ja", "lo", "ko", "id", "ms",       // === GROUP 1: ModelSEA ===
+        "fr", "de", "es", "nl", "it", "pt", "cs", "sv", "ru", "hi"  // === GROUP 2: ModelEU ===
     };
 
     private static IReadOnlyList<string> TargetLangs => Languages.Where(l => l != "en").ToList();
 
     internal static readonly Dictionary<string, string> LangNames = new()
     {
-        ["km"] = "Khmer",
-        ["zh"] = "Simplified Chinese",
-        ["vi"] = "Vietnamese",
-        ["th"] = "Thai",
-        ["de"] = "German",
-        ["ja"] = "Japanese",
-        ["fr"] = "French",
-        ["id"] = "Indonesian",
-        ["ms"] = "Malay",
-        ["ko"] = "Korean",
-        ["nl"] = "Dutch",
-        ["it"] = "Italian",
-        ["es"] = "Spanish",
-        ["hi"] = "Hindi",
-        ["ru"] = "Russian",
-        ["pt"] = "Portuguese",
-        ["cs"] = "Czech",
-        ["lo"] = "Lao",
-        ["sv"] = "Swedish"
+        ["km"] = "Khmer", ["zh"] = "Simplified Chinese", ["vi"] = "Vietnamese", ["th"] = "Thai", ["de"] = "German", ["ja"] = "Japanese",
+        ["fr"] = "French", ["id"] = "Indonesian", ["ms"] = "Malay", ["ko"] = "Korean", ["nl"] = "Dutch", ["it"] = "Italian",
+        ["es"] = "Spanish", ["hi"] = "Hindi", ["ru"] = "Russian", ["pt"] = "Portuguese", ["cs"] = "Czech", ["lo"] = "Lao", ["sv"] = "Swedish"
     };
 
-    // ======================
     // FIXED TRANSLATIONS FOR SPECIFIC KEYS
-    // ======================
     private static readonly Dictionary<string, Dictionary<string, string>> KeyOverrides = new()
     {
         ["km"] = new()
@@ -124,214 +81,88 @@ class Program
         }
     };
 
-    // ======================
-    // GLOSSARY + ECHO WATCHERS
-    // ======================
-
-    private static FileSystemWatcher? GlossaryWatcher;
-    private static FileSystemWatcher? EchoWatcher;
-    private static Dictionary<string, HashSet<string>> GlossarySnapshot = new(StringComparer.OrdinalIgnoreCase);
-    private static Dictionary<string, Dictionary<string, string>> Glossaries = new(StringComparer.OrdinalIgnoreCase);
-
-    private static void LoadGlossary()
+    static Program()
     {
-        try
+        AppDomain.CurrentDomain.ProcessExit += (s, e) => StopOllama();
+        Console.CancelKeyPress += (s, e) =>
         {
-            if (!File.Exists(GlossaryPath)) return;
-
-            var json = File.ReadAllText(GlossaryPath);
-            var newGlossaries = JsonSerializer.Deserialize<Dictionary<string, Dictionary<string, string>>>(json) ?? new();
-
-            foreach (var langEntry in newGlossaries)
-            {
-                string lang = langEntry.Key;
-                var currentRules = langEntry.Value;
-
-                if (!GlossarySnapshot.ContainsKey(lang))
-                {
-                    GlossarySnapshot[lang] = new HashSet<string>(currentRules.Keys, StringComparer.OrdinalIgnoreCase);
-                    continue;
-                }
-
-                var newKeysForThisLang = currentRules.Keys
-                    .Where(k => !GlossarySnapshot[lang].Contains(k))
-                    .ToList();
-
-                if (newKeysForThisLang.Any())
-                {
-                    PatchSpecificCache(lang, newKeysForThisLang, currentRules);
-
-                    foreach (var key in newKeysForThisLang)
-                    {
-                        GlossarySnapshot[lang].Add(key);
-                    }
-                }
-            }
-
-            Glossaries = newGlossaries;
-            Console.WriteLine("📘 glossary.json synchronized.");
-        }
-        catch (Exception ex)
-        {
-            Console.WriteLine($"⚠ Glossary hot-reload failed: {ex.Message}");
-        }
+            StopOllama();
+            Environment.Exit(0); 
+        };
     }
 
-    private static void PatchSpecificCache(string lang, List<string> newKeys, Dictionary<string, string> rules)
+    private static readonly HttpClient Http = new()
     {
-        string cachePath = Path.Combine(CacheFolder, $"cache_{lang}.json");
-        if (!File.Exists(cachePath)) return;
+        Timeout = TimeSpan.FromMinutes(15)
+    };
 
-        try
-        {
-            var cacheJson = File.ReadAllText(cachePath);
-            var targetCache = JsonSerializer.Deserialize<Dictionary<string, string>>(cacheJson) ?? new();
-            
-            var pendingChanges = new Dictionary<string, string>();
+    private static Process? OllamaProcess;
+    private static bool ForceOverwriteCache = false;
+    private static readonly StringBuilder FinalLog = new();
 
-            foreach (var englishTerm in newKeys)
-            {
-                string translation = rules[englishTerm];
-                var matches = targetCache.Where(kvp => kvp.Value.Contains(englishTerm, StringComparison.OrdinalIgnoreCase)).ToList();
-
-                foreach (var match in matches)
-                {
-                    string updatedValue = match.Value.Replace(englishTerm, translation, StringComparison.OrdinalIgnoreCase);
-                    if (match.Value != updatedValue)
-                    {
-                        pendingChanges[match.Key] = updatedValue;
-                    }
-                }
-            }
-
-            if (pendingChanges.Count > 0)
-            {
-                foreach (var change in pendingChanges)
-                {
-                    targetCache[change.Key] = change.Value;
-                }
-
-                var options = new JsonSerializerOptions { 
-                    WriteIndented = true, 
-                    Encoder = System.Text.Encodings.Web.JavaScriptEncoder.UnsafeRelaxedJsonEscaping 
-                };
-                File.WriteAllText(cachePath, JsonSerializer.Serialize(targetCache, options), Encoding.UTF8);
-
-                if (CurrentCacheFile.EndsWith($"cache_{lang}.json", StringComparison.OrdinalIgnoreCase))
-                {
-                    Cache = targetCache;
-                }
-                
-                Console.WriteLine($"✅ {lang}: {pendingChanges.Count} entries updated.\n");
-            }
-        }
-        catch (Exception ex)
-        {
-            Console.WriteLine($"⚠ Failed to patch {lang} cache: {ex.Message}");
-        }
-    }
-
-    // ======================
-    // ECHO CONFIG
-    // ======================
-    private class EchoConfig
-    {
-        public List<string> Global { get; set; } = new();
-        public Dictionary<string, List<string>> Languages { get; set; } = new();
-    }
-
-    private static HashSet<string> GlobalEchoExclusions = new(StringComparer.OrdinalIgnoreCase);
-
-    private static Dictionary<string, HashSet<string>> EchoExclusions = new(StringComparer.OrdinalIgnoreCase);
-
-    private static void LoadEchoConfig()
-    {
-        try
-        {
-            if (!File.Exists(EchoPath))
-            {
-                Console.WriteLine("⚠ echo.json not found.");
-                return;
-            }
-
-            var json = File.ReadAllText(EchoPath);
-            var config = JsonSerializer.Deserialize<EchoConfig>(json);
-
-            if (config == null) return;
-
-            GlobalEchoExclusions =
-                new HashSet<string>(config.Global ?? new(), StringComparer.OrdinalIgnoreCase);
-
-            EchoExclusions =
-                config.Languages?.ToDictionary(
-                    k => k.Key,
-                    v => new HashSet<string>(v.Value ?? new(), StringComparer.OrdinalIgnoreCase),
-                    StringComparer.OrdinalIgnoreCase
-                ) ?? new();
-
-            Console.WriteLine("📘 echo.json loaded.");
-        }
-        catch (Exception ex)
-        {
-            Console.WriteLine($"⚠ Echo load failed: {ex.Message}");
-        }
-    }
-
-    // ======================
-    // HOT RELOAD 
-    // ======================
-    private static void StartHotReload(
-        string filePath,
-        ref FileSystemWatcher? watcher,
-        Action reloadAction,
-        string label,
-        int debounceMs = 300)
-    {
-        try
-        {
-            watcher = new FileSystemWatcher(Path.GetDirectoryName(filePath)!)
-            {
-                Filter = Path.GetFileName(filePath),
-                NotifyFilter = NotifyFilters.LastWrite | NotifyFilters.Size,
-                EnableRaisingEvents = true
-            };
-
-            Timer? timer = null;
-
-            watcher.Changed += (_, __) =>
-            {
-                timer?.Dispose();
-                timer = new Timer(_ =>
-                {
-                    try
-                    {
-                        reloadAction();
-                        Console.WriteLine($"♻ {label} changed — reloaded.");
-                    }
-                    catch (Exception ex)
-                    {
-                        Console.WriteLine($"⚠ {label} reload failed: {ex.Message}");
-                    }
-                }, null, debounceMs, Timeout.Infinite);
-            };
-
-            Console.WriteLine($"👀 {label} hot-reload enabled.");
-        }
-        catch (Exception ex)
-        {
-            Console.WriteLine($"⚠ {label} watcher failed: {ex.Message}");
-        }
-    }
-
-    // ======================
     // CACHE PER LANGUAGE
-    // ======================
     private static Dictionary<string, string> Cache = new();
     private static string CurrentCacheFile = "";
 
-    // ======================
+    // CACHE HANDLING PER LANGUAGE
+    private static void LoadCache()
+    {
+        Cache = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+
+        if (!string.IsNullOrEmpty(CurrentCacheFile) && File.Exists(CurrentCacheFile))
+        {
+            try
+            {
+                var rawJson = File.ReadAllText(CurrentCacheFile);
+                var loaded = JsonSerializer.Deserialize<Dictionary<string, string>>(rawJson);
+
+                if (loaded != null)
+                {
+                    foreach (var kvp in loaded)
+                    {
+                        string cleanKey = kvp.Key.Replace("\r", "").Replace("\n", " ").Trim();
+                        Cache[cleanKey] = kvp.Value;
+                    }
+                    Console.WriteLine($"🗂 Loaded cache [{Path.GetFileName(CurrentCacheFile)}] with {Cache.Count} entries");
+                }
+            }
+            catch
+            {
+                Console.WriteLine($"⚠ Failed to read cache [{Path.GetFileName(CurrentCacheFile)}], starting fresh");
+            }
+        }
+        else
+        {
+            Console.WriteLine($"🗂 No existing cache [{Path.GetFileName(CurrentCacheFile)}], starting fresh");
+        }
+        Console.WriteLine();
+    }
+
+    private static void SaveCache()
+    {
+        if (string.IsNullOrEmpty(CurrentCacheFile)) return;
+
+        try
+        {
+            var options = new JsonSerializerOptions
+            {
+                WriteIndented = true,
+                Encoder = System.Text.Encodings.Web.JavaScriptEncoder.UnsafeRelaxedJsonEscaping 
+            };
+
+            string json = JsonSerializer.Serialize(Cache, options);
+
+            var encodingWithBOM = new UTF8Encoding(true); 
+            
+            File.WriteAllText(CurrentCacheFile, json, encodingWithBOM);
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"⚠ Cache save error: {ex.Message}");
+        }
+    }
+    static bool showDebug = false;
     // MAIN
-    // ======================
     static async Task Main(string[] args)
     {
         Console.OutputEncoding = Encoding.UTF8;
@@ -346,16 +177,21 @@ class Program
                 -p  | Razor Page | -p seahorse or -p seahorse durian
                 -d  | add directoty to path | -d city or -d city offices
                 -f  | force overwrite cache
-                -hl | hashleak scan: re-translates entries with Latin characters in non-Latin languages
+                -v  | Debug Mode
                 ==============================
             ");
             return;
         }
 
-        bool scanForLeakage = args.Contains("-hl");
-        ForceOverwriteCache = args.Contains("-f");
+        showDebug = args.Contains("-v");
+        string directory = "";
 
-        if (scanForLeakage) Console.WriteLine("🔍 Script Leakage Scan mode enabled.\n");
+        for (int i = 0; i < args.Length; i++)
+        {
+            if (args[i] == "-d" && i + 1 < args.Length) directory = args[i + 1];
+        }
+
+        ForceOverwriteCache = args.Contains("-f");
 
         List<string> workingResxFolders = new() { ResxFolder };
 
@@ -526,28 +362,6 @@ class Program
                 CurrentCacheFile = Path.Combine(CacheFolder, $"cache_{lang}.json");
                 LoadCache();
 
-                // --- HASHLEAK (-hl) AUDIT WITH LOGGING ---
-                if (scanForLeakage)
-                {
-                    var leakedEntries = Cache.Where(kvp => HasScriptLeakage(lang, kvp.Value)).ToList();
-
-                    if (leakedEntries.Any())
-                    {
-                        Console.WriteLine($"\n🔍 [Audit {lang}] Found {leakedEntries.Count} leaked entries:");
-                        
-                        foreach (var entry in leakedEntries)
-                        {
-                            Console.WriteLine($"   ❌ Purging Key: {entry.Key.Split("||").Last()} (Value: \"{entry.Value}\")");
-                            Cache.Remove(entry.Key);
-                        }
-                        Console.WriteLine($"♻️ Purge complete. These {leakedEntries.Count} items will be re-sent to AI.\n");
-                    }
-                    else
-                    {
-                        Console.WriteLine($"✅ [Audit {lang}] Cache is 100% clean. No leakage detected.");
-                    }
-                }
-
                 Console.WriteLine($"🌍 {lang} (Using: {activeModel})");
                 Console.WriteLine();
                 
@@ -643,9 +457,7 @@ class Program
         return Regex.IsMatch(scrubbed, "[A-Za-z]|&");
     }
 
-    // ======================
     // TRANSLATE
-    // ======================
     private static async Task<string?> TranslateAsync( string text, string lang, string key, string pageName, string modelName, Dictionary<string, string>? glossary = null ) 
     {
         if (KeyOverrides.TryGetValue(lang, out var langOverrides) &&
@@ -680,11 +492,26 @@ class Program
         string processedText = numericContext.ProcessedText;
 
         var langName = LangNames.GetValueOrDefault(lang, lang);
-        
+
+        Dictionary<string, string>? currentLangGlossary = null;
+        if (Glossaries != null && Glossaries.TryGetValue(lang, out var foundGlossary))
+        {
+            currentLangGlossary = foundGlossary;
+        }
+
+        string generatedPrompt = PromptService.BuildPrompt(text, lang, langName, Cache, currentLangGlossary);
+
+        if (showDebug)
+        {
+            Console.WriteLine($"\n--- DEBUG PROMPT FOR {langName} ---");
+            Console.WriteLine(generatedPrompt);
+            Console.WriteLine("----------------------------------\n");
+        }
+
         var payload = new
             {
                 model = modelName,
-                prompt = PromptService.BuildPrompt(processedText, lang, langName, glossary),
+                prompt = generatedPrompt,
                 options = new {
                     temperature = 0,
                     num_thread = 8,
@@ -767,9 +594,7 @@ class Program
         }
     }
 
-    // ======================
     // CHECK / START OLLAMA
-    // ======================
     private static async Task<bool> IsOllamaRunning()
     {
         try
@@ -842,9 +667,200 @@ class Program
         catch { }
     }
 
-    // ======================
+    // HOT RELOAD 
+    private static void StartHotReload(
+        string filePath,
+        ref FileSystemWatcher? watcher,
+        Action reloadAction,
+        string label,
+        int debounceMs = 300)
+    {
+        try
+        {
+            watcher = new FileSystemWatcher(Path.GetDirectoryName(filePath)!)
+            {
+                Filter = Path.GetFileName(filePath),
+                NotifyFilter = NotifyFilters.LastWrite | NotifyFilters.Size,
+                EnableRaisingEvents = true
+            };
+
+            Timer? timer = null;
+
+            watcher.Changed += (_, __) =>
+            {
+                timer?.Dispose();
+                timer = new Timer(_ =>
+                {
+                    try
+                    {
+                        reloadAction();
+                        Console.WriteLine($"♻ {label} changed — reloaded.");
+                    }
+                    catch (Exception ex)
+                    {
+                        Console.WriteLine($"⚠ {label} reload failed: {ex.Message}");
+                    }
+                }, null, debounceMs, Timeout.Infinite);
+            };
+
+            Console.WriteLine($"👀 {label} hot-reload enabled.");
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"⚠ {label} watcher failed: {ex.Message}");
+        }
+    }
+    
+    // GLOSSARY + ECHO WATCHERS
+
+    private static FileSystemWatcher? GlossaryWatcher;
+    private static FileSystemWatcher? EchoWatcher;
+    private static Dictionary<string, HashSet<string>> GlossarySnapshot = new(StringComparer.OrdinalIgnoreCase);
+    private static Dictionary<string, Dictionary<string, string>> Glossaries = new(StringComparer.OrdinalIgnoreCase);
+
+    private static void LoadGlossary()
+    {
+        try
+        {
+            if (!File.Exists(GlossaryPath)) return;
+
+            var json = File.ReadAllText(GlossaryPath);
+            var newGlossaries = JsonSerializer.Deserialize<Dictionary<string, Dictionary<string, string>>>(json) ?? new();
+
+            foreach (var langEntry in newGlossaries)
+            {
+                string lang = langEntry.Key;
+                var currentRules = langEntry.Value;
+
+                if (!GlossarySnapshot.ContainsKey(lang))
+                {
+                    GlossarySnapshot[lang] = new HashSet<string>(currentRules.Keys, StringComparer.OrdinalIgnoreCase);
+                    continue;
+                }
+
+                var newKeysForThisLang = currentRules.Keys
+                    .Where(k => !GlossarySnapshot[lang].Contains(k))
+                    .ToList();
+
+                if (newKeysForThisLang.Any())
+                {
+                    PatchSpecificCache(lang, newKeysForThisLang, currentRules);
+
+                    foreach (var key in newKeysForThisLang)
+                    {
+                        GlossarySnapshot[lang].Add(key);
+                    }
+                }
+            }
+
+            Glossaries = newGlossaries;
+            Console.WriteLine("📘 glossary.json synchronized.");
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"⚠ Glossary hot-reload failed: {ex.Message}");
+        }
+    }
+
+    private static void PatchSpecificCache(string lang, List<string> newKeys, Dictionary<string, string> rules)
+    {
+        string cachePath = Path.Combine(CacheFolder, $"cache_{lang}.json");
+        if (!File.Exists(cachePath)) return;
+
+        try
+        {
+            var cacheJson = File.ReadAllText(cachePath);
+            var targetCache = JsonSerializer.Deserialize<Dictionary<string, string>>(cacheJson) ?? new();
+            
+            var pendingChanges = new Dictionary<string, string>();
+
+            foreach (var englishTerm in newKeys)
+            {
+                string translation = rules[englishTerm];
+                var matches = targetCache.Where(kvp => kvp.Value.Contains(englishTerm, StringComparison.OrdinalIgnoreCase)).ToList();
+
+                foreach (var match in matches)
+                {
+                    string updatedValue = match.Value.Replace(englishTerm, translation, StringComparison.OrdinalIgnoreCase);
+                    if (match.Value != updatedValue)
+                    {
+                        pendingChanges[match.Key] = updatedValue;
+                    }
+                }
+            }
+
+            if (pendingChanges.Count > 0)
+            {
+                foreach (var change in pendingChanges)
+                {
+                    targetCache[change.Key] = change.Value;
+                }
+
+                var options = new JsonSerializerOptions { 
+                    WriteIndented = true, 
+                    Encoder = System.Text.Encodings.Web.JavaScriptEncoder.UnsafeRelaxedJsonEscaping 
+                };
+                File.WriteAllText(cachePath, JsonSerializer.Serialize(targetCache, options), Encoding.UTF8);
+
+                if (CurrentCacheFile.EndsWith($"cache_{lang}.json", StringComparison.OrdinalIgnoreCase))
+                {
+                    Cache = targetCache;
+                }
+                
+                Console.WriteLine($"✅ {lang}: {pendingChanges.Count} entries updated.\n");
+            }
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"⚠ Failed to patch {lang} cache: {ex.Message}");
+        }
+    }
+
+    // ECHO CONFIG
+    private class EchoConfig
+    {
+        public List<string> Global { get; set; } = new();
+        public Dictionary<string, List<string>> Languages { get; set; } = new();
+    }
+
+    private static HashSet<string> GlobalEchoExclusions = new(StringComparer.OrdinalIgnoreCase);
+
+    private static Dictionary<string, HashSet<string>> EchoExclusions = new(StringComparer.OrdinalIgnoreCase);
+
+    private static void LoadEchoConfig()
+    {
+        try
+        {
+            if (!File.Exists(EchoPath))
+            {
+                Console.WriteLine("⚠ echo.json not found.");
+                return;
+            }
+
+            var json = File.ReadAllText(EchoPath);
+            var config = JsonSerializer.Deserialize<EchoConfig>(json);
+
+            if (config == null) return;
+
+            GlobalEchoExclusions =
+                new HashSet<string>(config.Global ?? new(), StringComparer.OrdinalIgnoreCase);
+
+            EchoExclusions =
+                config.Languages?.ToDictionary(
+                    k => k.Key,
+                    v => new HashSet<string>(v.Value ?? new(), StringComparer.OrdinalIgnoreCase),
+                    StringComparer.OrdinalIgnoreCase
+                ) ?? new();
+
+            Console.WriteLine("📘 echo.json loaded.");
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"⚠ Echo load failed: {ex.Message}");
+        }
+    }
+
     // ECHO DETECTION
-    // ======================
     private static bool IsEnglishEcho(string src, string trg)
     {
         string Normalize(string s) => string.Join(" ", s.ToLower().Split());
@@ -877,10 +893,8 @@ class Program
 
         return false;
     }
-
-    // ======================
+    
     // REVIEW LOG
-    // ======================
     private static void WriteReviewLog(string pageName, string lang, string key, string source, string output)
     {
         try
@@ -899,9 +913,7 @@ class Program
         }
     }
 
-    // ======================
     // FINAL LOG
-    // ======================
     private static void WriteFinalLog(List<string> folders, List<string>? resources)
     {
         try
@@ -933,63 +945,6 @@ class Program
         catch (Exception ex)
         {
             Console.WriteLine($"⚠ Failed to write final log: {ex.Message}");
-        }
-    }
-
-    // ======================
-    // CACHE HANDLING PER LANGUAGE
-    // ======================
-    private static void LoadCache()
-    {
-        Cache = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
-
-        if (!string.IsNullOrEmpty(CurrentCacheFile) && File.Exists(CurrentCacheFile))
-        {
-            try
-            {
-                var rawJson = File.ReadAllText(CurrentCacheFile);
-                var loaded = JsonSerializer.Deserialize<Dictionary<string, string>>(rawJson);
-
-                if (loaded != null)
-                {
-                    foreach (var kvp in loaded)
-                    {
-                        string cleanKey = kvp.Key.Replace("\r", "").Replace("\n", " ").Trim();
-                        Cache[cleanKey] = kvp.Value;
-                    }
-                    Console.WriteLine($"🗂 Loaded cache [{Path.GetFileName(CurrentCacheFile)}] with {Cache.Count} entries");
-                }
-            }
-            catch
-            {
-                Console.WriteLine($"⚠ Failed to read cache [{Path.GetFileName(CurrentCacheFile)}], starting fresh");
-            }
-        }
-        else
-        {
-            Console.WriteLine($"🗂 No existing cache [{Path.GetFileName(CurrentCacheFile)}], starting fresh");
-        }
-        Console.WriteLine();
-    }
-
-    private static void SaveCache()
-    {
-        if (string.IsNullOrEmpty(CurrentCacheFile)) return;
-
-        try
-        {
-            var options = new JsonSerializerOptions
-            {
-                WriteIndented = true,
-                Encoder = System.Text.Encodings.Web.JavaScriptEncoder.UnsafeRelaxedJsonEscaping
-            };
-
-            string json = JsonSerializer.Serialize(Cache, options);
-            File.WriteAllText(CurrentCacheFile, json, Encoding.UTF8);
-        }
-        catch (Exception ex)
-        {
-            Console.WriteLine($"⚠ Cache save error: {ex.Message}");
         }
     }
 }
