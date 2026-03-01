@@ -30,7 +30,7 @@ class Program
         return dir.FullName;
     }
 
-    private static readonly string ConfigFolder =
+    internal static readonly string ConfigFolder =
         Path.Combine(ProjectRoot, "config");
 
     private static readonly string CacheFolder =
@@ -47,7 +47,7 @@ class Program
     private static string GlossaryPath = Path.Combine(ConfigFolder, "glossary.json");
     private static string EchoPath = Path.Combine(ConfigFolder, "echo.json");
 
-    private static readonly HashSet<string> Excluded = new(StringComparer.OrdinalIgnoreCase) { "AccommodationsFolder", "RestaurantsFolder", "Districts" };
+    private static readonly HashSet<string> Excluded = new(StringComparer.OrdinalIgnoreCase) { "noFolderDummy" };
 
     private static readonly string ReviewLogPath = Path.Combine( Environment.GetFolderPath(Environment.SpecialFolder.Desktop), "review.log" );
     private static readonly HashSet<string> ReviewLogExcludedPages = new(StringComparer.OrdinalIgnoreCase)  { "boinc" };
@@ -68,6 +68,7 @@ class Program
     };
 
     // FIXED TRANSLATIONS FOR SPECIFIC KEYS
+
     private static readonly Dictionary<string, Dictionary<string, string>> KeyOverrides = new()
     {
         ["km"] = new()
@@ -79,6 +80,13 @@ class Program
             ["The Khmer language has a unique sound and tone system, which can be difficult for learners to master. Our audio files feature native speakers pronouncing words and phrases correctly, allowing you to learn the correct intonation and rhythm."] = "高棉语拥有独特的语音和声调系统，这对学习者来说可能难以掌握。我们的音频文件由母语人士朗读单词和短语，帮助您学习正确的语调和节奏。",
             ["Additionally, Kampot's natural beauty and proximity to attractions like the Bokor National Park and Kep beach make it an ideal location for those who love outdoor activities. The city's relaxed pace allows expats to enjoy a balanced life, blending work with exploration and leisure."] = "此外，贡布的自然美景以及毗邻博科国家公园和白马海滩等景点的地理位置，使其成为户外运动爱好者的理想之地。这座城市悠闲的生活节奏让外籍人士能够享受平衡的生活，将工作、探索和休闲完美融合。"
         }
+    };
+
+    // VALUE WILL STAY IN ENGLISH FOR MODELEU KEYS 
+
+    private static readonly HashSet<string> ProtectedKeys = new(StringComparer.OrdinalIgnoreCase) 
+    { 
+        "" 
     };
 
     static Program()
@@ -101,6 +109,7 @@ class Program
     private static readonly StringBuilder FinalLog = new();
 
     // CACHE PER LANGUAGE
+
     private static Dictionary<string, string> Cache = new();
     private static string CurrentCacheFile = "";
 
@@ -162,6 +171,8 @@ class Program
         }
     }
     static bool showDebug = false;
+    static bool OnlyNew = false;
+
     // MAIN
     static async Task Main(string[] args)
     {
@@ -177,6 +188,7 @@ class Program
                 -p  | Razor Page | -p seahorse or -p seahorse durian
                 -d  | add directoty to path | -d city or -d city offices
                 -f  | force overwrite cache
+                -n  | only show new translations (no cache hits)
                 -v  | Debug Mode
                 ==============================
             ");
@@ -190,6 +202,8 @@ class Program
         {
             if (args[i] == "-d" && i + 1 < args.Length) directory = args[i + 1];
         }
+
+        OnlyNew = args.Contains("-n");
 
         ForceOverwriteCache = args.Contains("-f");
 
@@ -336,13 +350,13 @@ class Program
             );
         }
 
+        string lastModel = "";
+
         foreach (var baseFile in baseFiles)
         {
             Console.WriteLine($"\n📄 {Path.GetFileName(baseFile)}");
             var baseDoc = XDocument.Load(baseFile);
             var pageName = Path.GetFileNameWithoutExtension(baseFile);
-
-            string lastModel = "";
 
             foreach (var lang in targetLangs)
             {
@@ -352,12 +366,13 @@ class Program
                                     : "translategemma:27b";
 
                 if (activeModel != lastModel && !string.IsNullOrEmpty(lastModel))
-                {
-                    Console.WriteLine($"🔄 MODEL SWITCH: Unloading {lastModel} and loading {activeModel}...");
-                    Console.WriteLine("⏳ This may take 30-60 seconds ...");
-                    Console.WriteLine();
-                }
-                lastModel = activeModel;
+                        {
+                            Console.WriteLine($"🔄 MODEL SWITCH: Purging {lastModel} to load {activeModel}...");
+                            await UnloadModelAsync(lastModel); 
+                            Console.WriteLine("⏳ This may take 30-60 seconds ...");
+                            Console.WriteLine();
+                        }
+                        lastModel = activeModel;
 
                 CurrentCacheFile = Path.Combine(CacheFolder, $"cache_{lang}.json");
                 LoadCache();
@@ -381,13 +396,22 @@ class Program
                     var source = value.Value;
                     var key = data.Attribute("name")?.Value ?? "alt";
 
-                    var translated = await TranslateAsync(source, lang, key, pageName, activeModel, sessionGlossary);
+                    string? translated;
+
+                    if (activeModel == "ModelEU" && ProtectedKeys.Contains(key))
+                    {
+                        translated = source;
+                    }
+                    else 
+                    {
+                        translated = await TranslateAsync(source, lang, key, pageName, activeModel, sessionGlossary);
+                    }
                     
                     if (translated != null)
                     {
                         value.Value = translated;
 
-                         if (source.Split(' ').Length < 5 && !sessionGlossary.ContainsKey(source))
+                        if (source.Split(' ').Length < 5 && !sessionGlossary.ContainsKey(source))
                         {
                             sessionGlossary[source] = translated; 
                         }
@@ -401,11 +425,11 @@ class Program
                 Console.WriteLine($"✅ Written {Path.GetFileName(outPath)} ({stopwatch.Elapsed.TotalSeconds:F2} sec)");
                 Console.WriteLine();
             }
+        }
 
-            if (!string.IsNullOrEmpty(lastModel))
-            {
-                await UnloadModelAsync(lastModel);
-            }
+        if (!string.IsNullOrEmpty(lastModel))
+        {
+            await UnloadModelAsync(lastModel);
         }
 
         WriteFinalLog(workingResxFolders, specificResources);
@@ -458,7 +482,7 @@ class Program
     }
 
     // TRANSLATE
-    private static async Task<string?> TranslateAsync( string text, string lang, string key, string pageName, string modelName, Dictionary<string, string>? glossary = null ) 
+    private static async Task<string?> TranslateAsync(string text, string lang, string key, string pageName, string modelName, Dictionary<string, string>? glossary = null) 
     {
         if (KeyOverrides.TryGetValue(lang, out var langOverrides) &&
             langOverrides.TryGetValue(key, out var fixedTranslation))
@@ -468,13 +492,10 @@ class Program
 
         if (glossary != null && glossary.TryGetValue(key, out var glossaryValue))
         {
-            Console.WriteLine($"📘 [Glossary Hit {lang} {key}] {text}\n➡️ {glossaryValue}");
-            Console.WriteLine();
-            
+            Console.WriteLine($"📘 [Glossary Hit {lang} {key}] {text}\n➡️ {glossaryValue}\n");
             var cleanTxt = text.Replace("\r", "").Replace("\n", " ").Trim();
             Cache[$"{lang}||{cleanTxt}"] = glossaryValue;
             SaveCache();
-            
             return glossaryValue;
         }
 
@@ -483,23 +504,39 @@ class Program
 
         if (Cache.TryGetValue(cacheKey, out var cached) && !ForceOverwriteCache)
         {
-            Console.WriteLine($"[Cache hit {lang} {key}] {text}\n➡️ {cached}\n");
+            if (!OnlyNew)
+            {
+                Console.WriteLine($"[Cache hit {lang} {key}] {text}\n➡️ {cached}\n");
+            }
             FinalLog.AppendLine($"{lang} {key} | {cached}\n");
             return cached;
         }
+        var group1 = new[] { "km", "zh", "vi", "th", "ja", "lo", "ko", "id", "ms" };
+        bool isGroup1 = group1.Contains(lang.ToLower());
+        var langName = LangNames.GetValueOrDefault(lang, lang);
 
         var numericContext = PromptService.NumericProcessor.Preprocess(text, lang);
         string processedText = numericContext.ProcessedText;
 
-        var langName = LangNames.GetValueOrDefault(lang, lang);
-
-        Dictionary<string, string>? currentLangGlossary = null;
-        if (Glossaries != null && Glossaries.TryGetValue(lang, out var foundGlossary))
+        var placeholderMap = new Dictionary<string, string>();
+        if (isGroup1 && Glossaries.TryGetValue(lang, out var langGlossary))
         {
-            currentLangGlossary = foundGlossary;
+            int i = 0;
+
+            foreach (var entry in langGlossary.OrderByDescending(x => x.Key.Length))
+            {
+                string placeholder = $"[[TERM{i}]]";
+                if (processedText.Contains(entry.Key, StringComparison.OrdinalIgnoreCase))
+                {
+                    processedText = Regex.Replace(processedText, Regex.Escape(entry.Key), placeholder, RegexOptions.IgnoreCase);
+                    placeholderMap[placeholder] = entry.Value;
+                    i++;
+                }
+            }
         }
 
-        string generatedPrompt = PromptService.BuildPrompt(text, lang, langName, Cache, currentLangGlossary);
+        var promptGlossary = isGroup1 ? null : (Glossaries.TryGetValue(lang, out var g) ? g : null);
+        string generatedPrompt = PromptService.BuildPrompt(processedText, lang, langName, Cache, promptGlossary);
 
         if (showDebug)
         {
@@ -508,42 +545,33 @@ class Program
             Console.WriteLine("----------------------------------\n");
         }
 
-        var payload = new
-            {
-                model = modelName,
-                prompt = generatedPrompt,
-                options = new {
-                    temperature = 0,
-                    num_thread = 8,
-                    num_ctx = 4096
-                },
-                keep_alive = "5m"
-            };
+        var payload = new {
+            model = modelName,
+            prompt = generatedPrompt,
+            options = new { temperature = 0, num_thread = 8, num_ctx = 4096 },
+            keep_alive = "5m"
+        };
 
-        try
+        try 
         {
-            var response = await Http.PostAsync(
-                OllamaGenerateUrl,
-                new StringContent(JsonSerializer.Serialize(payload), Encoding.UTF8, "application/json")
-            );
-
+            var response = await Http.PostAsync(OllamaGenerateUrl, new StringContent(JsonSerializer.Serialize(payload), Encoding.UTF8, "application/json"));
             response.EnsureSuccessStatusCode();
-
             var raw = await response.Content.ReadAsStringAsync();
             var result = new StringBuilder();
 
             foreach (var line in raw.Split('\n', StringSplitOptions.RemoveEmptyEntries))
             {
-                try
-                {
-                    using var doc = JsonDocument.Parse(line);
-                    if (doc.RootElement.TryGetProperty("response", out var r))
-                        result.Append(r.GetString());
-                }
-                catch { }
+                using var doc = JsonDocument.Parse(line);
+                if (doc.RootElement.TryGetProperty("response", out var r)) result.Append(r.GetString());
             }
 
             var translated = result.ToString();
+
+            if (isGroup1)
+            {
+                foreach (var kvp in placeholderMap) 
+                    translated = translated.Replace(kvp.Key, kvp.Value);
+            }
 
             translated = PromptService.NumericProcessor.Postprocess(translated, numericContext, lang);
 
@@ -551,26 +579,15 @@ class Program
 
             if (!text.Contains("\n") && translated.Contains("\n"))
             {
-                var firstLine = translated.Split('\n')
-                                          .FirstOrDefault(l => !string.IsNullOrWhiteSpace(l))?
-                                          .Trim();
-
-                if (!string.IsNullOrEmpty(firstLine))
-                {
-                    translated = firstLine;
-                    Console.WriteLine($"✂️ [Auto-Cleaned] Reduced list dump to: {translated}");
-                }
+                translated = translated.Split('\n').FirstOrDefault(l => !string.IsNullOrWhiteSpace(l))?.Trim() ?? translated;
             }
 
             if (!text.EndsWith(".") && !text.EndsWith("!") && !text.EndsWith("?"))
             {
-                translated = translated.TrimEnd('.', '!', '?');
+                translated = translated.TrimEnd('.', '!', '?', ' ');
             }
 
-            bool echo = IsEnglishEcho(text, translated);
-            bool leak = HasScriptLeakage(lang, translated);
-
-            if ((echo && !IsEchoExcluded(lang, text, translated)) || leak)
+            if ((IsEnglishEcho(text, translated) && !IsEchoExcluded(lang, text, translated)) || HasScriptLeakage(lang, translated))
             {
                 if (!ReviewLogExcludedPages.Contains(pageName))
                 {
@@ -582,7 +599,6 @@ class Program
             Cache[cacheKey] = translated;
             SaveCache();
             FinalLog.AppendLine($"{lang} {key} | {translated}\n");
-
             Console.WriteLine($"[{(ForceOverwriteCache ? "Rewrite" : "New")} {lang} {key}] {text}\n➡️ {translated}\n");
 
             return translated;
